@@ -27,25 +27,132 @@ const DEMO_RESULTS = [
 ];
 
 // ─────────────────────────────────────────────────────────────
-// AI PROMPT
+// KEYWORD EXTRACTION — parse intent signals from raw query
+// ─────────────────────────────────────────────────────────────
+function extractSignals(query) {
+  const q = query.toLowerCase();
+  const signals = {};
+
+  // ── Category detection ──
+  const catPatterns = {
+    cars:       [/\b(car|cars|auto|vehicle|suv|sedan|coupe|bmw|audi|mercedes|vw|volkswagen|tesla|toyota|ford|honda|used car|gebrauchtwagen|voiture|auto)\b/i],
+    realestate: [/\b(apartment|flat|house|villa|studio|wohnung|immobilie|zimmer|room|rent|buy|sale|property|real estate|miete|kauf|bedroom|BR|sqm|m²|warm|cold|kalt|nebenkosten)\b/i],
+    hotels:     [/\b(hotel|hostel|airbnb|resort|motel|stay|night|accommodation|room)\b/i],
+    flights:    [/\b(flight|fly|airline|airport|ticket|direct|nonstop|→|to .+ from|from .+ to)\b/i],
+    ecommerce:  [/\b(buy|shop|laptop|phone|macbook|iphone|samsung|product|item|brand new|used|ebay|amazon)\b/i],
+    news:       [/\b(news|article|headline|trending|breaking|report)\b/i],
+  };
+  const detectedCats = Object.entries(catPatterns)
+    .filter(([, patterns]) => patterns.some(p => p.test(q)))
+    .map(([cat]) => cat);
+  if (detectedCats.length) signals.categories = detectedCats;
+
+  // ── Price detection ──
+  // "under €2000", "max 25000", "budget 500", "€1500-2500", "bis 1500"
+  const priceMax = q.match(/(?:under|max|bis|below|unter|moins de|menos de|up to)\s*[€$£¥]?\s*(\d[\d,\.]*)/i);
+  const priceMin = q.match(/(?:from|ab|from|desde|de|over|above|min)\s*[€$£¥]?\s*(\d[\d,\.]*)/i);
+  const priceRange = q.match(/[€$£¥]?\s*(\d[\d,\.]+)\s*[-–to]+\s*[€$£¥]?\s*(\d[\d,\.]+)/i);
+  if (priceMax)   signals.priceMax = parseInt(priceMax[1].replace(/[,\.]/g, ""));
+  if (priceMin)   signals.priceMin = parseInt(priceMin[1].replace(/[,\.]/g, ""));
+  if (priceRange) {
+    signals.priceMin = parseInt(priceRange[1].replace(/[,\.]/g, ""));
+    signals.priceMax = parseInt(priceRange[2].replace(/[,\.]/g, ""));
+  }
+
+  // ── Rooms detection ──
+  const rooms = q.match(/(\d+)\s*(?:bedroom|zimmer|room|br|bed|pièce|habitaci)/i) ||
+                q.match(/(\d+)-(?:bedroom|zimmer|room|br)/i);
+  if (rooms) signals.rooms = parseInt(rooms[1]);
+
+  // ── Rent vs buy ──
+  if (/\b(rent|miete|mieten|warm|kalt|monat|monthly|per month|\/mo)\b/i.test(q)) signals.transactionType = "Rent";
+  if (/\b(buy|kaufen|kauf|purchase|sale|for sale|zu verkaufen)\b/i.test(q)) signals.transactionType = "Buy";
+
+  // ── Car specifics ──
+  const yearMatch = q.match(/\b(20\d{2}|19\d{2})\b/);
+  if (yearMatch) signals.year = yearMatch[1];
+  const mileage = q.match(/(?:under|max|below|bis)\s*(\d+)\s*(?:km|miles|mi)\b/i);
+  if (mileage) signals.maxMileage = parseInt(mileage[1]);
+  if (/\b(electric|ev|elektro|hybrid)\b/i.test(q)) signals.fuel = "Electric/Hybrid";
+  if (/\b(diesel)\b/i.test(q)) signals.fuel = "Diesel";
+  if (/\b(petrol|gasoline|benzin|benzine)\b/i.test(q)) signals.fuel = "Petrol";
+  if (/\b(automatic|automatik|auto gearbox)\b/i.test(q)) signals.gearbox = "Automatic";
+  if (/\b(manual|schaltwagen|schaltgetriebe)\b/i.test(q)) signals.gearbox = "Manual";
+
+  // ── Hotel specifics ──
+  const stars = q.match(/(\d)\s*star/i);
+  if (stars) signals.stars = parseInt(stars[1]);
+  if (/\b(pool|swimming)\b/i.test(q)) signals.pool = true;
+  if (/\b(breakfast|frühstück|included)\b/i.test(q)) signals.breakfast = true;
+
+  // ── Flight specifics ──
+  if (/\b(direct|nonstop|non-stop)\b/i.test(q)) signals.directOnly = true;
+  const flightRoute = q.match(/([a-z]{3})\s*(?:→|->|to)\s*([a-z]{3})/i);
+  if (flightRoute) { signals.from = flightRoute[1].toUpperCase(); signals.to = flightRoute[2].toUpperCase(); }
+
+  // ── Location detection ──
+  const locationMatch = q.match(/\bin\s+([a-züäöß\s]+?)(?:\s+under|\s+max|\s+for|\s+with|\s+rent|\s+buy|$)/i) ||
+                        q.match(/([A-ZÜÄÖa-züäöß][a-züäöß]+(?:\s+[A-Za-z]+)?),?\s+(?:germany|uk|france|spain|italy|netherlands|china|usa)/i);
+  if (locationMatch) signals.location = locationMatch[1].trim();
+
+  // ── Size detection ──
+  const sizeMatch = q.match(/(\d+)\s*(?:sqm|m²|m2|square meter)/i);
+  if (sizeMatch) signals.minSize = parseInt(sizeMatch[1]);
+
+  return signals;
+}
+
+// ─────────────────────────────────────────────────────────────
+// AI PROMPT — enriched with extracted signals
 // ─────────────────────────────────────────────────────────────
 function buildPrompt(query, countryName, allSources, customNames) {
+  const signals = extractSignals(query);
+
+  // Build a structured constraint block from detected signals
+  const constraints = [];
+  if (signals.categories?.length)  constraints.push(`Detected categories: ${signals.categories.join(", ")}`);
+  if (signals.priceMax)            constraints.push(`Maximum price: ${signals.priceMax} (STRICT — do not exceed)`);
+  if (signals.priceMin)            constraints.push(`Minimum price: ${signals.priceMin}`);
+  if (signals.rooms)               constraints.push(`Rooms required: ${signals.rooms}`);
+  if (signals.transactionType)     constraints.push(`Transaction type: ${signals.transactionType}`);
+  if (signals.year)                constraints.push(`Year: ${signals.year}`);
+  if (signals.maxMileage)          constraints.push(`Max mileage: ${signals.maxMileage} km`);
+  if (signals.fuel)                constraints.push(`Fuel type: ${signals.fuel}`);
+  if (signals.gearbox)             constraints.push(`Gearbox: ${signals.gearbox}`);
+  if (signals.stars)               constraints.push(`Hotel stars: ${signals.stars}+`);
+  if (signals.pool)                constraints.push(`Pool: required`);
+  if (signals.breakfast)           constraints.push(`Breakfast: included`);
+  if (signals.directOnly)          constraints.push(`Flights: direct only`);
+  if (signals.from && signals.to)  constraints.push(`Flight route: ${signals.from} → ${signals.to}`);
+  if (signals.minSize)             constraints.push(`Minimum size: ${signals.minSize} m²`);
+  if (signals.location)            constraints.push(`Specific location: ${signals.location}`);
+
+  const constraintBlock = constraints.length
+    ? `\nEXTRACTED CONSTRAINTS (you MUST respect all of these):\n${constraints.map(c => `  • ${c}`).join("\n")}`
+    : "";
+
   return `You are the AI brain of Argus — a multi-source global search platform.
 
 User query: "${query}"
 ${countryName ? `Country/Region: ${countryName}` : "No specific region."}
 ${allSources && allSources.length ? `Platforms: ${allSources.join(", ")}` : "Use global platforms."}
 ${customNames && customNames.length ? `Custom sources (include 1+ result from each): ${customNames.join(", ")}` : ""}
+${constraintBlock}
 
 RULES:
-1. Only include categories RELEVANT to the query. Be selective.
-   "BMW 3 Series" → cars only. "Bali trip" → flights + hotels. "Berlin apartment" → real estate.
-2. Generate 4-6 results per relevant category.
-3. Use real platform names for the region.
-4. Include a REAL search URL per result pointing to actual platform search pages.
-5. Do NOT include news — handled by dedicated news APIs.
-6. Prices must be realistic for the market.
-7. Descriptions must be specific — 2-3 sentences.
+1. Only include categories RELEVANT to the query. Be VERY selective and strict.
+   - "BMW 3 Series" → cars ONLY
+   - "Bali trip" → flights + hotels ONLY
+   - "Berlin apartment" → real estate ONLY
+   - "news" or any query containing the word "news" → return EMPTY ARRAY []
+   - If the query is primarily about news/trends/articles → return EMPTY ARRAY []
+2. If the query asks for NEWS of any kind, return an empty array [].
+3. Generate 4-6 results per relevant category.
+4. ALL results MUST satisfy the extracted constraints above — especially price limits.
+5. Use real platform names for the region (ImmobilienScout24/WG-Gesucht for Germany, Rightmove for UK etc).
+6. Include a REAL search URL per result with filters applied where possible.
+7. Prices must be realistic for the market AND within any stated budget.
+8. Descriptions must mention the specific features asked for.
 
 Return ONLY a valid JSON array. No markdown, no explanation.
 
@@ -53,16 +160,16 @@ Each item MUST have ALL these fields:
 {
   "id": "unique_string",
   "category": "cars|realestate|hotels|flights|ecommerce",
-  "title": "specific realistic title",
+  "title": "specific realistic title matching the query constraints",
   "source": "real platform name",
-  "url": "https://real-search-url.com/path",
-  "price": "€22,500 or null",
-  "priceRaw": 22500,
+  "url": "https://real-search-url.com/path-with-filters",
+  "price": "€1,750 warm or null",
+  "priceRaw": 1750,
   "location": "City, Country",
-  "description": "2-3 specific sentences",
+  "description": "2-3 sentences referencing the specific features requested",
   "details": {
     for cars:       { "Year": "2021", "Mileage": "45,000 km", "Fuel": "Diesel", "Gearbox": "Automatic", "Registration": "03/2021", "Owners": "1" }
-    for realestate: { "Type": "Rent", "Rooms": "3", "Size": "85 m²", "Floor": "2nd", "Available": "Now" }
+    for realestate: { "Type": "Rent", "Rooms": "2", "Size": "65 m²", "Floor": "3rd", "Available": "Now" }
     for hotels:     { "Stars": "4", "Rating": "8.8", "Breakfast": "Included", "Pool": "Yes" }
     for flights:    { "Duration": "2h 15m", "Stops": "Direct", "Departs": "08:30", "Class": "Economy" }
     for ecommerce:  { "Condition": "Like New", "Age": "6 months", "Warranty": "Yes" }
@@ -70,6 +177,8 @@ Each item MUST have ALL these fields:
   "rating": 4.7,
   "reviews": 312
 }`;
+}
+
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -145,21 +254,35 @@ async function callDeepSeek(apiKey, prompt) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// NEWS: NewsAPI.org — global English news
+// NEWS: NewsAPI.org — location-aware English news
 // ─────────────────────────────────────────────────────────────
-async function fetchNewsAPI(query, apiKey) {
+
+// ─────────────────────────────────────────────────────────────
+// Real-time news: pass the full user query directly to NewsAPI
+// NewsAPI searches titles + descriptions across 80,000+ sources
+// sortBy=publishedAt = freshest articles first, always
+// ─────────────────────────────────────────────────────────────
+async function fetchNewsAPI(query, apiKey, countryName, page = 1) {
   try {
+    const { newsQuery, displayLocation } = extractNewsQuery(query, countryName);
+    const pageSize = 5;
+
     const res = await fetch(
-      `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&sortBy=publishedAt&pageSize=5&language=en&apiKey=${apiKey}`
+      `https://newsapi.org/v2/everything` +
+      `?q=${encodeURIComponent(newsQuery)}` +
+      `&sortBy=publishedAt` +
+      `&pageSize=${pageSize}` +
+      `&page=${page}` +
+      `&language=en` +
+      `&apiKey=${apiKey}`
     );
     const data = await res.json();
     if (data.status !== "ok" || !data.articles?.length) return [];
 
     return data.articles
       .filter(a => a.title && a.url && a.title !== "[Removed]" && a.description)
-      .slice(0, 4)
       .map((a, i) => ({
-        id:          `news_global_${i}`,
+        id:          `news_global_p${page}_${i}`,
         category:    "news",
         title:       a.title,
         source:      a.source?.name || "News",
@@ -167,11 +290,11 @@ async function fetchNewsAPI(query, apiKey) {
         image:       a.urlToImage || null,
         price:       null,
         priceRaw:    null,
-        location:    "Global",
+        location:    displayLocation,
         description: a.description,
         details: {
-          Topic:     query.split(" ").slice(0, 3).join(" "),
-          Region:    "Global",
+          Topic:     newsQuery.split(" ").slice(0, 3).join(" "),
+          Region:    displayLocation,
           Read:      "3 min",
           Published: timeAgo(a.publishedAt),
         },
@@ -183,6 +306,7 @@ async function fetchNewsAPI(query, apiKey) {
     return [];
   }
 }
+
 
 // ─────────────────────────────────────────────────────────────
 // NEWS: Juhe 聚合数据 — Chinese news (GFW-safe)
@@ -291,7 +415,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const { query, countryName, allSources, customNames } = req.body;
+  const { query, countryName, allSources, customNames, page = 1, newsOnly = false } = req.body;
   if (!query) return res.status(400).json({ error: "No query provided" });
 
   const claudeKey   = process.env.ANTHROPIC_API_KEY;  // optional — add when available
@@ -303,35 +427,42 @@ export default async function handler(req, res) {
   const chinaUser   = isFromChina(req);
   const prompt      = buildPrompt(query, countryName, allSources, customNames);
 
-  // ── Step 1: Get AI results ──────────────────────────────────
+  // ── Step 1: Get AI results (skip if newsOnly request) ───────
   let results = null;
   let aiUsed  = "demo";
 
-  if (chinaUser) {
-    // China: DeepSeek only (Claude blocked by GFW)
-    if (deepseekKey) {
-      try   { results = await callDeepSeek(deepseekKey, prompt); aiUsed = "deepseek"; }
-      catch (e) { console.error("DeepSeek (CN) failed:", e.message); }
+  if (!newsOnly) {
+    if (chinaUser) {
+      if (deepseekKey) {
+        try   { results = await callDeepSeek(deepseekKey, prompt); aiUsed = "deepseek"; }
+        catch (e) { console.error("DeepSeek (CN) failed:", e.message); }
+      }
+    } else {
+      if (claudeKey) {
+        try   { results = await callClaude(claudeKey, prompt); aiUsed = "claude"; }
+        catch (e) { console.error("Claude failed:", e.message); }
+      }
+      if (!results && deepseekKey) {
+        try   { results = await callDeepSeek(deepseekKey, prompt); aiUsed = "deepseek"; }
+        catch (e) { console.error("DeepSeek fallback failed:", e.message); }
+      }
+    }
+
+    // If query is news-only use empty array not demo
+    if (!results) {
+      const isNewsQuery = /\bnews\b|\btrend\b|\bheadline\b|\barticle\b/i.test(query);
+      results = isNewsQuery ? [] : DEMO_RESULTS;
+      aiUsed  = isNewsQuery ? "news-only" : "demo";
     }
   } else {
-    // Non-China: Claude first, DeepSeek fallback
-    if (claudeKey) {
-      try   { results = await callClaude(claudeKey, prompt); aiUsed = "claude"; }
-      catch (e) { console.error("Claude failed:", e.message); }
-    }
-    if (!results && deepseekKey) {
-      try   { results = await callDeepSeek(deepseekKey, prompt); aiUsed = "deepseek"; }
-      catch (e) { console.error("DeepSeek fallback failed:", e.message); }
-    }
+    // newsOnly=true — skip AI entirely, just fetch more news
+    results = [];
+    aiUsed  = "news-only";
   }
-
-  // Final AI fallback
-  if (!results) { results = DEMO_RESULTS; aiUsed = "demo"; }
 
   // ── Step 2: Get real news and inject ───────────────────────
   // China users → Juhe (Chinese news, no VPN needed)
-  // Global users → NewsAPI (English news)
-  // Both run in parallel with AI call results above
+  // Global users → NewsAPI (English news, location-aware, paginated)
 
   let newsSource = "ai";
   let realNews   = [];
@@ -340,11 +471,12 @@ export default async function handler(req, res) {
     realNews   = await fetchJuheNews(query, juheKey);
     newsSource = realNews.length ? "juhe" : "ai";
   } else if (!chinaUser && newsApiKey) {
-    realNews   = await fetchNewsAPI(query, newsApiKey);
+    // Pass page number for pagination
+    realNews   = await fetchNewsAPI(query, newsApiKey, countryName, page);
     newsSource = realNews.length ? "newsapi" : "ai";
   }
 
-  // Replace any AI-generated news with real news
+  // Replace or append news results
   if (realNews.length) {
     results = [
       ...results.filter(r => r.category !== "news"),
@@ -359,6 +491,7 @@ export default async function handler(req, res) {
       aiUsed,
       newsSource,
       chinaUser,
+      page,
       // webzReady: false,  // flip to true in Month 6 when WEBZ_TOKEN added
     },
   });

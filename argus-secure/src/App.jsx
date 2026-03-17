@@ -104,6 +104,13 @@ function RBCard({ r, imgH, imgIndex }) {
   const cat = CATS.find(c => c.id === r.category);
 
   return (
+    <a
+      href={r.url || "#"}
+      target={r.url ? "_blank" : "_self"}
+      rel="noopener noreferrer"
+      style={{ textDecoration:"none", color:"inherit", display:"flex", flexDirection:"column", height:"100%" }}
+      onClick={e => { if (!r.url) e.preventDefault(); }}
+    >
     <div
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
@@ -113,13 +120,13 @@ function RBCard({ r, imgH, imgIndex }) {
         boxShadow: hovered ? "0 20px 52px rgba(0,0,0,0.14)" : "0 2px 14px rgba(0,0,0,0.06)",
         transform: hovered ? "translateY(-5px)" : "none",
         transition:"all 0.3s cubic-bezier(0.34,1.56,0.64,1)",
-        cursor:"pointer", display:"flex", flexDirection:"column", height:"100%",
+        cursor: r.url ? "pointer" : "default", display:"flex", flexDirection:"column", height:"100%",
       }}
     >
       {/* Image */}
       {r.category !== "news" && (
         <div style={{ position:"relative", height:imgH, flexShrink:0, overflow:"hidden" }}>
-          <img src={getImg(r.category, imgIndex)} alt={r.title}
+          <img src={r.image || getImg(r.category, imgIndex)} alt={r.title}
             style={{ width:"100%", height:"100%", objectFit:"cover", display:"block",
               transform: hovered ? "scale(1.06)" : "scale(1)", transition:"transform 0.6s ease" }}
           />
@@ -188,6 +195,7 @@ function RBCard({ r, imgH, imgIndex }) {
         )}
       </div>
     </div>
+    </a>
   );
 }
 
@@ -222,6 +230,9 @@ export default function ArgusApp() {
   const [logs, setLogs]         = useState([]);
   const [filterCat, setFilterCat] = useState("all");
   const [sortBy, setSortBy]     = useState("relevance");
+  const [newsPage, setNewsPage] = useState(1);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMoreNews, setHasMoreNews] = useState(true);
   const inputRef = useRef(null);
 
   // ── Custom sources (saved to profile via localStorage) ──
@@ -270,6 +281,8 @@ export default function ArgusApp() {
     setLoading(true);
     setLogs([]);
     setResults({});
+    setNewsPage(1);
+    setHasMoreNews(true);
 
     const countryName   = country ? country.replace(/^[^\s]+\s+/, "") : null;
     const customNames   = customSources.map(s => `${s.display} (${CATS.find(c=>c.id===s.category)?.label||s.category})`);
@@ -296,17 +309,15 @@ export default function ArgusApp() {
     await new Promise(r => setTimeout(r, 500));
 
     try {
-      // Secure: call our own backend — API key never exposed to browser
       const res = await fetch("/api/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, countryName, allSources, customNames }),
+        body: JSON.stringify({ query, countryName, allSources, customNames, page: 1 }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Search failed");
       const parsed = data.results;
 
-      // Group by category
       const grouped = {};
       parsed.forEach(r => {
         if (!grouped[r.category]) grouped[r.category] = [];
@@ -317,7 +328,6 @@ export default function ArgusApp() {
       setResults({ grouped, query, country: countryName, total: parsed.length });
 
     } catch (err) {
-      // Fallback demo grouped by category
       console.error("Search error:", err.message);
       const grouped = {};
       DEMO_RESULTS.forEach(r => {
@@ -330,6 +340,48 @@ export default function ArgusApp() {
 
     setLoading(false);
     setScreen("results");
+  };
+
+  // Load more news when user scrolls to bottom of news section
+  const loadMoreNews = async () => {
+    if (loadingMore || !hasMoreNews) return;
+    setLoadingMore(true);
+    const nextPage = newsPage + 1;
+    const countryName = country ? country.replace(/^[^\s]+\s+/, "") : null;
+    try {
+      const res = await fetch("/api/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query,
+          countryName,
+          allSources,
+          customNames: customSources.map(s => s.display),
+          page: nextPage,
+          newsOnly: true,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Load more failed");
+      const newNewsItems = (data.results || []).filter(r => r.category === "news");
+      if (newNewsItems.length === 0) {
+        setHasMoreNews(false);
+      } else {
+        setNewsPage(nextPage);
+        setResults(prev => ({
+          ...prev,
+          grouped: {
+            ...prev.grouped,
+            news: [...(prev.grouped?.news || []), ...newNewsItems],
+          },
+          total: (prev.total || 0) + newNewsItems.length,
+        }));
+      }
+    } catch (err) {
+      console.error("Load more news failed:", err.message);
+      setHasMoreNews(false);
+    }
+    setLoadingMore(false);
   };
 
   // Flat list for filtering
@@ -624,6 +676,7 @@ export default function ArgusApp() {
               {CATS.map(cat => {
                 const items = (results.grouped?.[cat.id] || []);
                 if (!items.length) return null;
+                const isNews = cat.id === "news";
                 return (
                   <div key={cat.id} style={{ marginBottom:36 }}>
                     <div style={{ padding:"0 40px 12px", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
@@ -637,10 +690,22 @@ export default function ArgusApp() {
                     </div>
                     <div style={{ display:"flex", gap:14, overflowX:"auto", paddingLeft:40, paddingRight:40, paddingBottom:10, scrollbarWidth:"none" }}>
                       {items.map((r, i) => (
-                        <div key={r.id} className="fu" style={{ animationDelay:`${i*0.07}s`, flexShrink:0, width: cat.id==="news" ? 300 : 250 }}>
+                        <div key={r.id} className="fu" style={{ animationDelay:`${i*0.07}s`, flexShrink:0, width: isNews ? 300 : 250 }}>
                           <RBCard r={r} imgH={CARD_HEIGHTS[i % CARD_HEIGHTS.length]} imgIndex={i} />
                         </div>
                       ))}
+                      {/* Load More News button — inline at end of news row */}
+                      {isNews && hasMoreNews && (
+                        <div style={{ flexShrink:0, width:160, display:"flex", alignItems:"center", justifyContent:"center", paddingRight:16 }}>
+                          <button
+                            onClick={loadMoreNews}
+                            disabled={loadingMore}
+                            style={{ padding:"10px 20px", background: loadingMore ? "#f0ece8" : "#1a1612", border:"none", borderRadius:24, color: loadingMore ? "#a89e94" : "white", fontSize:12, fontWeight:700, cursor: loadingMore ? "default" : "pointer", fontFamily:"inherit", whiteSpace:"nowrap" }}
+                          >
+                            {loadingMore ? "Loading…" : "More news →"}
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </div>
                 );
