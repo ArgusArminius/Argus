@@ -4,5 +4,10 @@
   "framework": "vite",
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/$1" }
-  ]
+  ],
+  "functions": {
+    "api/ai.js":     { "maxDuration": 30 },
+    "api/news.js":   { "maxDuration": 30 },
+    "api/search.js": { "maxDuration": 30 }
+  }
 }
